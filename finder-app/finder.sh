@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/sh
 
 # check on number of args
 if [ $# -ne 2 ]; then
@@ -19,7 +19,7 @@ fi
 # count number of files in directory
 FILES_LIST=$(ls ${FILES_DIR})
 FILES_NUM=$(ls ${FILES_DIR} | wc -l)
-MATCH_NUM=$(grep --recursive "${SEARCH_STR}" ${FILES_DIR} | wc -l)
+MATCH_NUM=$(grep -r "${SEARCH_STR}" ${FILES_DIR} | wc -l)
 
 echo "The number of files are ${FILES_NUM} and the number of matching lines are ${MATCH_NUM}"
 
