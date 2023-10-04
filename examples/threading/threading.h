@@ -14,6 +14,9 @@ struct thread_data{
      * between the start_thread_obtaining_mutex function and
      * your thread implementation.
      */
+    int wait_to_obtain;
+    int wait_to_release;
+    pthread_mutex_t *mutex;
 
     /**
      * Set to true if the thread completed with success, false
