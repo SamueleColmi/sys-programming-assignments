@@ -6,17 +6,22 @@ CC = gcc
 
 # Flags
 CFLAGS = -Wall -c
+LDFLAGS = -Wall
 
 # Build
 .PHONY: all
 
 all: $(TARGET)
 
-$(TARGET) : $(OBJ)
-	@$(CROSS_COMPILE)$(CC) $^ -o $@
+$(TARGET) : $(TARGET).c
+	@$(CROSS_COMPILE)$(CC) $(CFLAGS) $^ -o $@
 
-$(OBJ) : $(TARGET).c
-	@$(CROSS_COMPILE)$(CC) $(CFLAGS) -o $@ $<
+# $(TARGET) : $(OBJ)
+# 	@$(CROSS_COMPILE)$(CC) $(LDFLAGS) $^ -o $@
+
+# $(OBJ) : $(TARGET).c
+# 	@$(CROSS_COMPILE)$(CC) $(CFLAGS) $^ -o $@
+# 	@chmod 664 $@
 
 
 # Clean
