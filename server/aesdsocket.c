@@ -33,7 +33,7 @@ static bool reply(int sock_fd, FILE **fp)
 	char *msg_buffer;
 	size_t buf_alloc;
 	size_t buf_dim;
-	char ch;
+	int ch;
 
 	msg_buffer = calloc(BUFFER_SIZE, sizeof(char));
 	buf_alloc = BUFFER_SIZE;
@@ -43,9 +43,9 @@ static bool reply(int sock_fd, FILE **fp)
 
 	fseek(*fp, 0, SEEK_SET);
 
-	ch = fgetc(*fp);
-	while (ch != EOF)
+	while ((ch = fgetc(*fp)) != EOF)
 	{
+		char c = (char)ch;
 		if (buf_dim + 1 >= buf_alloc) {
 			msg_buffer = realloc(msg_buffer, 2 * buf_alloc * sizeof(char)+1);
 			if (!msg_buffer)
@@ -53,10 +53,8 @@ static bool reply(int sock_fd, FILE **fp)
 			buf_alloc *= 2;
 		}
 
-		strncat(&msg_buffer[0], &ch, sizeof(char));
+		strncat(&msg_buffer[0], &c, sizeof(char));
 		buf_dim++;
-
-		ch = fgetc(*fp);
 	}
 
 	if (send(sock_fd, msg_buffer, strlen(msg_buffer), 0) == -1) {
