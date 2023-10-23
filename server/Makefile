@@ -2,11 +2,11 @@
 TARGET = aesdsocket
 OBJ = aesdsocket.o
 RM = rm -f
-CC = gcc
+CC ?= gcc
 
 # Flags
-CFLAGS = -Wall -c
-LDFLAGS = -Wall -g
+CFLAGS ?= -Wall -c
+LDFLAGS ?= -Wall -g
 
 # Build
 .PHONY: all
