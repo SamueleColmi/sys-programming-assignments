@@ -60,14 +60,19 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     ssize_t read = 0;
     ssize_t offset;
 
+    if (mutex_lock_interruptible(&dev->lock))
+        return -ERESTARTSYS;
+
     do {
         entry = aesd_circular_buffer_find_entry_offset_for_fpos(&(dev->buffer), *f_pos, &offset);
         if (offset != 0)
             PDEBUG("WARNING: offset is not zero: %ld", offset);
-        if (!entry)
+        if (!entry) {
+            PDEBUG("entry is null, exiting");
             goto exit;
+        }
 
-        // PDEBUG("Read: %s", entry->buffptr);
+        PDEBUG("Read: %s", entry->buffptr);
 
         if (copy_to_user(buf + (read), entry->buffptr, entry->size)) {
             PDEBUG("ERROR: copy_to_user() failed");
@@ -79,6 +84,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     } while (read < count);
 
 exit:
+    mutex_unlock(&dev->lock);
     return read;
 }
 
@@ -88,37 +94,62 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     PDEBUG("write %zu bytes with offset %lld",count,*f_pos);
 
     struct aesd_dev *dev = filp->private_data;
-    struct aesd_buffer_entry buf_entry;
+    struct aesd_buffer_entry new_entry;
     ssize_t retval = count;
     const char *ret_buf;
-    char *buffer;
+    char *tmp_buf;
 
-    buffer = kmalloc(count * sizeof(char), GFP_KERNEL);
-    if (!buffer) {
-        PDEBUG("ERROR: buffer kmalloc failed");
+    if (mutex_lock_interruptible(&dev->lock))
+        return -ERESTARTSYS;
+
+    tmp_buf = krealloc(dev->write_buffer.buffptr, (dev->write_buffer.size + count) * sizeof(char), GFP_KERNEL);
+    if (!tmp_buf) {
+        PDEBUG("ERROR: krealloc failed");
         retval = -ENOMEM;
         goto exit;
     }
 
-    if (copy_from_user(buffer, buf, count)) {
+    if (copy_from_user(tmp_buf + dev->write_buffer.size, buf, count)) {
         PDEBUG("ERROR: copy_from_user() failed");
         retval = -EFAULT;
-        goto copy_err;
+        goto err;
     }
 
-    buf_entry.buffptr = buffer;
-    buf_entry.size = count;
-    ret_buf = aesd_circular_buffer_add_entry(&(dev->buffer), &buf_entry);
-    if (ret_buf) {
-        PDEBUG("buffer wrapped, freeing some memory");
-        kfree(ret_buf);
+    dev->write_buffer.buffptr = tmp_buf;
+    dev->write_buffer.size += count;
+
+    PDEBUG("tmp: %s", tmp_buf);
+    PDEBUG("write_buffer: %s", dev->write_buffer.buffptr);
+
+    if (dev->write_buffer.buffptr[dev->write_buffer.size - 1] == '\n') {
+        new_entry.buffptr = kmalloc(dev->write_buffer.size * sizeof(char), GFP_KERNEL);
+        if (!new_entry.buffptr) {
+            PDEBUG("ERROR: kmalloc on new entry failed");
+            retval = -ENOMEM;
+            goto err;
+        }
+
+        strncpy((char * const)new_entry.buffptr, dev->write_buffer.buffptr, dev->write_buffer.size);
+        new_entry.size = dev->write_buffer.size;
+
+        ret_buf = aesd_circular_buffer_add_entry(&(dev->buffer), &(new_entry));
+        if (ret_buf) {
+            PDEBUG("buffer wrapped, freeing some memory %p", (void *)ret_buf);
+            kfree(ret_buf);
+        }
+
+        kfree(dev->write_buffer.buffptr);
+        dev->write_buffer.buffptr = NULL;
+        dev->write_buffer.size = 0;
     }
 
+    mutex_unlock(&dev->lock);
     return retval;
 
-copy_err:
-    kfree(buffer);
+err:
+    kfree(dev->write_buffer.buffptr);
 exit:
+    mutex_unlock(&dev->lock);
     return retval;
 }
 
@@ -171,10 +202,12 @@ int aesd_init_module(void)
         result = -ENOMEM;
         goto alloc_err;
     } else {
-        PDEBUG("aesd_device struct kmalloc success");
+        PDEBUG("aesd_device struct kzmalloc success");
     }
     memset(aesd_device,0,sizeof(struct aesd_dev));
-    // mutex_init
+    aesd_device->write_buffer.buffptr = NULL;
+    aesd_device->write_buffer.size = 0;
+    mutex_init(&aesd_device->lock);
 
     /* Device setup */
     result = aesd_setup_cdev(aesd_device);
@@ -187,6 +220,7 @@ int aesd_init_module(void)
     return 0;
 
 setup_err:
+    mutex_destroy(&aesd_device->lock);
     kfree(aesd_device);
 alloc_err:
     unregister_chrdev_region(dev, 1);
@@ -196,13 +230,9 @@ alloc_err:
 
 static void cleanup_buffer(void)
 {
-    int idx;
-
     for (int i = 0; i < AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; i++) {
-        idx = (aesd_device->buffer.out_offs + i) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
-
-        if (aesd_device->buffer.entry[idx].buffptr)
-            kfree(aesd_device->buffer.entry[idx].buffptr);
+        if (aesd_device->buffer.entry[i].buffptr)
+            kfree(aesd_device->buffer.entry[i].buffptr);
     }
 }
 
@@ -210,16 +240,31 @@ void aesd_cleanup_module(void)
 {
     dev_t devno;
 
+    PDEBUG("cleanup");
+
     devno = MKDEV(aesd_major, aesd_minor);
     cdev_del(&aesd_device->cdev);
 
+    PDEBUG("cdev_del() done");
+
     cleanup_buffer();
 
-    // mutex_destroy
+    PDEBUG("cleanup_buffer() done");
+
+    if (aesd_device->write_buffer.buffptr) {
+        kfree(aesd_device->write_buffer.buffptr);
+        PDEBUG("write_buffer freed");
+    }
+
+    mutex_destroy(&aesd_device->lock);
 
     kfree(aesd_device);
 
+    PDEBUG("kfree(aesd_device) done");
+
     unregister_chrdev_region(devno, 1);
+    PDEBUG("unregister_chrdev_region() done");
+    PDEBUG("cleanup done");
 }
 
 module_init(aesd_init_module);

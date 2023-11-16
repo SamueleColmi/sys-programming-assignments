@@ -27,7 +27,9 @@
 
 struct aesd_dev
 {
+    struct aesd_buffer_entry write_buffer;
     struct aesd_circular_buffer buffer;
+    struct mutex lock;
     struct cdev cdev;
 };
 
