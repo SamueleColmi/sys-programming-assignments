@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/fs.h>
+#include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <signal.h>
@@ -19,6 +20,7 @@
 
 #define PORTNUM		(9000)
 #define BUFFER_SIZE	(8)
+#define USE_AESD_CHAR_DEVICE
 
 typedef struct node
 {
@@ -32,11 +34,16 @@ typedef struct node
 
 typedef TAILQ_HEAD(head_s, node) head_t;
 
+#ifdef USE_AESD_CHAR_DEVICE
+static const char *device_path = "/dev/aesdchar";
+#else
 static const char *file_path = "/var/tmp/aesdsocketdata";
 static const char *dir_path = "/var/tmp/";
+static pthread_mutex_t lock;
+#endif
+
 static bool daemon_mode = false;
 static bool terminate = false;
-static pthread_mutex_t lock;
 static head_t head;
 static FILE *fp;
 
@@ -49,55 +56,161 @@ static void close_connection(int io_fd, struct sockaddr_in addr)
 
 static bool reply(int sock_fd)
 {
-	char *msg_buffer;
-	size_t buf_alloc;
-	size_t buf_dim;
-	bool r;
-	int ch;
+	size_t allocated = BUFFER_SIZE;
+	char *msg_buffer = NULL;
+	size_t new_size = 0;
+	bool ret = false;
+	size_t used = 0;
+	char *tmp = NULL;
+	char *c = NULL;
+	int ch = 0;
 
-	r = true;
-	msg_buffer = calloc(BUFFER_SIZE, sizeof(char));
-	buf_alloc = BUFFER_SIZE;
-	buf_dim = 1;
-	if (!msg_buffer)
-		return false;
+	printf("REPLY in\n");
 
-	// pthread_mutex_lock(&lock);
+	if (fseek(fp, 0, SEEK_SET)) {
+		printf("Error: fseek failed: (-%d) %s\n", errno, strerror(errno));
+		goto exit;
+	}
 
-	fseek(fp, 0, SEEK_SET);
+	msg_buffer = calloc(allocated, sizeof(char));
+	if (!msg_buffer) {
+		printf("Error: can't allocate memory for msg_buffer: (-%d) %s\n", errno, strerror(errno));
+		goto exit;
+	}
+	msg_buffer[used] = '\0';
+	used++; // points to '\0'
 
-	while ((ch = fgetc(fp)) != EOF)
-	{
-		char c = (char)ch;
-		if (buf_dim + 1 >= buf_alloc) {
-			msg_buffer = realloc(msg_buffer, 2 * buf_alloc * sizeof(char)+1);
-			if (!msg_buffer) {
-				r = false;
-				// pthread_mutex_unlock(&lock);
-				goto exit;
-			}
-			buf_alloc *= 2;
+	c = calloc(1, sizeof(char));
+	if (!c) {
+		printf("Error: can't allocate memory for char: (-%d) %s\n", errno, strerror(errno));
+		goto free_buf;
+	}
+
+	printf("before while:\n---\n%s---\n", msg_buffer);
+	bool once = true;
+	while ((ch = fgetc(fp)) != EOF) {
+		if (once) {
+			printf("after while:\n---\n%s---\n", msg_buffer);
+			once = false;
 		}
 
-		strncat(&msg_buffer[0], &c, sizeof(char));
-		buf_dim++;
+		// *c = (char)ch;
+		sprintf(c, "%c", ch);
+		if (*c == '\0')
+			printf("**************EOF**************\n");
+		// printf("read: %c (%x)\n", *c, (unsigned)(*c));
+		strncat(msg_buffer, c, sizeof(char));
+		used++;
+
+		if (used >= allocated) {
+			new_size = allocated * 2;
+
+			printf("reallocating %ld\n", new_size);
+			tmp = realloc(msg_buffer, new_size);
+			if (!tmp) {
+				printf("Error: can't reallocate memory for msg_buffer: (-%d) %s\n", errno, strerror(errno));
+				goto free_all;
+			}
+			msg_buffer = tmp;
+			allocated = new_size;
+		}
 	}
 
-	// pthread_mutex_unlock(&lock);
-
-	if (send(sock_fd, msg_buffer, strlen(msg_buffer), 0) == -1) {
-		printf("Error sending message back: (-%d) %s\n", errno, strerror(errno));
-		printf("%s\n", msg_buffer);
-		r = false;
+	int sended = 0;
+	if ((sended = send(sock_fd, msg_buffer, used - 1, 0)) == -1) {
+		printf("Error: can't reply: (-%d) %s\n", errno, strerror(errno));
 	} else {
-		// printf("%s\n", msg_buffer);
-		// sleep(1);
+		ret = true;
+		printf("Sended: %d - used: %ld\n", sended, used);
 	}
 
-exit:
+	printf("buffer:\n----------\n");
+	printf("%s", msg_buffer);
+	printf("----------\n");
+
+free_all:
+	free(c);
+	// c = NULL;
+free_buf:
 	free(msg_buffer);
-	return r;
+	// msg_buffer = NULL;
+exit:
+	return ret;
 }
+
+// static bool reply(int sock_fd)
+// {
+// 	char *msg_buffer;
+// 	size_t buf_alloc;
+// 	size_t buf_dim;
+// 	bool r;
+// 	int ch;
+
+// 	r = true;
+// 	msg_buffer = calloc(BUFFER_SIZE, sizeof(char));
+// 	buf_alloc = BUFFER_SIZE;
+// 	buf_dim = 1;
+// 	if (!msg_buffer) {
+// 		printf("calloc failed");
+// 		return false;
+// 	}
+
+// 	char *c = malloc(sizeof(char) + 1);
+// 	if (!c) {
+// 		printf("malloc on char failed\n");
+// 		r = false;
+// 		goto exit;
+// 	}
+
+// 	if (fseek(fp, 0, SEEK_SET)) {
+// 		printf("Error: fseek failed: (-%d) %s\n", errno, strerror(errno));
+// 	}
+
+// 	printf("New reply\n");
+// 	printf("msg_buffer addr: %p\n", msg_buffer);
+// 	while ((ch = fgetc(fp)) != EOF)
+// 	{
+// 		*c = (char)ch;
+
+// 		if (buf_dim + 2 >= buf_alloc) {
+// 			size_t new_size = (2 * buf_alloc * sizeof(char)) + 1;
+// 			if (new_size >= sizeof(size_t) * CHAR_BIT)
+// 				new_size = sizeof(size_t) * CHAR_BIT;
+
+// 			char *tmp;
+// 			printf("about to realloc (%p) with size %zu\n", msg_buffer, new_size);
+// 			tmp = realloc(msg_buffer, new_size);
+// 			if (!tmp) {
+// 				r = false;
+// 				printf("realloc failed\n");
+// 				goto exit;
+// 			}
+
+// 			printf("realloc done, msg_buffer addr: %p\n", msg_buffer);
+// 			msg_buffer = tmp;
+// 			buf_alloc = new_size;
+// 		}
+// 		printf("read: %c\n", *c);
+// 		strncat(msg_buffer, c, sizeof(char));
+// 		printf("strncat of %c done - msg_buffer add: %p\n", *c, msg_buffer);
+// 		buf_dim++;
+// 	}
+// 	printf("EOF reached\n");
+
+// 	if (send(sock_fd, msg_buffer, strlen(msg_buffer), 0) == -1) {
+// 		printf("Error sending message back: (-%d) %s\n", errno, strerror(errno));
+// 		printf("%s\n", msg_buffer);
+// 		r = false;
+// 	} else {
+// 		printf("reply: %s\n", msg_buffer);
+// 		// sleep(1);
+// 	}
+
+// 	free(c);
+// exit:
+// 	free(msg_buffer);
+// 	return r;
+// }
 
 static bool communicate(int io_fd)
 {
@@ -105,29 +218,62 @@ static bool communicate(int io_fd)
 	int buf_size;
 	bool r;
 
+	printf("COMMUNICATE in\n");
+
 	r = true;
 	buf_size = BUFFER_SIZE * sizeof(char);
-	buffer = calloc(BUFFER_SIZE + 1, sizeof(char));
+	buffer = calloc(BUFFER_SIZE + 1, sizeof(char));	/* +1 for '\0' */
+	if (!buffer) {
+		printf("Error: can't allocate memory for write buffer\n");
+		goto exit;
+	}
 
+#ifndef USE_AESD_CHAR_DEVICE
 	pthread_mutex_lock(&lock);
-	while(recv(io_fd, buffer, buf_size, 0) > 0) {
-		int i = 0;
-		while (buffer[i] && i <= BUFFER_SIZE) {
-			fprintf(fp, "%c", buffer[i]);
-			if (buffer[i] == '\n') {
-				if (!reply(io_fd)) {
-					r = false;
-					goto exit;
-				}
+#endif
+
+	int rec = 0;
+	while((rec = recv(io_fd, buffer, buf_size, 0)) > 0) {
+
+		buffer[rec] = '\0';
+		fprintf(fp, "%s", buffer); // scrive fino a '\0' escluso
+		if (buffer[rec - 1] == '\n') {
+			if (!reply(io_fd)) {
+				printf("Error: reply\n");
+				r = false;
+				goto err;
 			}
-			i++;
+			printf("reply done\n");
 		}
 		memset(buffer, 0, buf_size);
 	}
-	pthread_mutex_unlock(&lock);
 
-exit:
+
+		// int i = 0;
+		// while (buffer[i] && i <= BUFFER_SIZE) {
+		// 	fprintf(fp, "%c", buffer[i]);
+		// 	// printf("wrote: %c\n", buffer[i]);
+		// 	if (buffer[i] == '\n') {
+		// 		if (!reply(io_fd)) {
+		// 			printf("ERROR on reply\n");
+		// 			r = false;
+		// 			goto err;
+		// 		}
+		// 	}
+		// 	i++;
+		// }
+
+
+	// printf("stop receiving\n");
+
+#ifndef USE_AESD_CHAR_DEVICE
+	pthread_mutex_unlock(&lock);
+#endif
+
+err:
 	free(buffer);
+exit:
+	printf("end communication\n");
 	return r;
 }
 
@@ -153,8 +299,9 @@ exit:
 static bool open_file()
 {
 	bool ret = false;
-	struct stat s;
 
+#ifndef USE_AESD_CHAR_DEVICE
+	struct stat s;
 	if (stat(dir_path, &s) == -1) {
 		if (mkdir(dir_path, 0755)) {
 			printf("Error creating directory %s: (-%d) %s\n", dir_path, errno, strerror(errno));
@@ -167,6 +314,13 @@ static bool open_file()
 		printf("Error opening file %s: (-%d) %s\n",file_path, errno, strerror(errno));
 		goto exit;
 	}
+#else
+	fp = fopen(device_path, "a+");
+	if (!fp) {
+		printf("Error opening device %s: (-%d) %s\n", device_path, errno, strerror(errno));
+		goto exit;
+	}
+#endif
 
 	ret = true;
 exit:
@@ -312,8 +466,8 @@ static void join_threads()
 		if (e->complete) {
 			if ((err = pthread_join(e->id, NULL)) != 0)
 				printf("Error joining thread with id=%ld: (-%d) %s\n", e->id, err, strerror(err));
-			// else
-			// 	printf("Thread %ld joined\n", e->id);
+			else
+				// printf("Thread %ld joined\n", e->id);
 
 			close_connection(e->io_fd, e->addr);
 			TAILQ_REMOVE(&head, e, nodes);
@@ -323,6 +477,7 @@ static void join_threads()
 	}
 }
 
+#ifndef USE_AESD_CHAR_DEVICE
 static void *timestamp_func(void *args)
 {
 	char buf[40];
@@ -368,14 +523,13 @@ static void kill_timestamp_thread(pthread_t tmstmp_id)
 	else
 		printf("Timestamp Thread joined\n");
 }
+#endif
 
 static void run_server()
 {
 	struct sockaddr_in addr;
-	pthread_t tmstmp_id;
 	int srv_fd;
 	int io_fd;
-	int err;
 
 	srv_fd = open_server_socket();
 	if (srv_fd == -1)
@@ -389,20 +543,27 @@ static void run_server()
 			return;
 	}
 
-	if (!open_file(&fp))
-		goto close_fp;
+	// if (!open_file(&fp))
+	// 	goto close_fp;
 
+#ifndef USE_AESD_CHAR_DEVICE
+	pthread_t tmstmp_id;
+	int err;
 	if ((err = pthread_mutex_init(&lock, NULL)) != 0) {
 		printf("Error initializing mutex: (-%d) %s\n", err, strerror(err));
 		goto close_fp;
 	}
 
 	run_timestamp_thread(&tmstmp_id);
+#endif
 
 	while (!terminate) {
 		io_fd = get_connection(srv_fd, &addr);
 		if (io_fd == -1)
 			continue;
+
+		if (!fp)
+			open_file(&fp);
 
 		if (!spawn_thread(io_fd, addr)) {
 			close(io_fd); // TODO: exit on destroy mutex (?)
@@ -412,10 +573,12 @@ static void run_server()
 		join_threads();
 	}
 
+#ifndef USE_AESD_CHAR_DEVICE
 	kill_timestamp_thread(tmstmp_id);
 
 	if ((err = pthread_mutex_destroy(&lock)) != 0)
 		printf("Error destroying mutex: (-%d) %s\n", err, strerror(err));
+#endif
 
 close_fp:
 	fclose(fp);
@@ -428,7 +591,10 @@ static void close_server()
 	node_t *e;
 
 	syslog(LOG_INFO, "Caught signal, exiting");
+
+#ifndef USE_AESD_CHAR_DEVICE
 	remove(file_path);
+#endif
 
 	while (!TAILQ_EMPTY(&head)) {
 		e = TAILQ_FIRST(&head);

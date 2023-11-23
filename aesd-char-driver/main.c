@@ -53,36 +53,49 @@ int aesd_release(struct inode *inode, struct file *filp)
 ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
                 loff_t *f_pos)
 {
-    PDEBUG("read %zu bytes with offset %lld",count,*f_pos);
+    PDEBUG("*** NEW READ %zu BYTES WITH F_POS %lld ***",count,*f_pos);
 
     struct aesd_dev *dev = filp->private_data;
     struct aesd_buffer_entry *entry;
+    bool read_again = true;
+    ssize_t how_many = 0;
+    ssize_t offset = 0;
     ssize_t read = 0;
-    ssize_t offset;
 
     if (mutex_lock_interruptible(&dev->lock))
         return -ERESTARTSYS;
 
-    do {
+    while (read_again) {
+        PDEBUG("bytes read up to now %ld out of %ld, remaining: %ld", read, count, count - read);
+        PDEBUG("reading at f_pos: %lld", *f_pos);
         entry = aesd_circular_buffer_find_entry_offset_for_fpos(&(dev->buffer), *f_pos, &offset);
-        if (offset != 0)
-            PDEBUG("WARNING: offset is not zero: %ld", offset);
         if (!entry) {
             PDEBUG("entry is null, exiting");
             goto exit;
         }
 
-        PDEBUG("Read: %s", entry->buffptr);
-
-        if (copy_to_user(buf + (read), entry->buffptr, entry->size)) {
-            PDEBUG("ERROR: copy_to_user() failed");
+        if ((int)((count - (read + entry->size))) > 0) {
+            how_many = entry->size;
+            PDEBUG("reading the whole entry - new bytes read: %ld", how_many);
+        } else {
+            how_many = (size_t)(count - read);
+            read_again = false;
+            if ((how_many + offset) > entry->size)
+                how_many -= ((how_many + offset) - entry->size);
+            PDEBUG("reading %ld new bytes out of %ld bytes available in entry", how_many, entry->size);
+            PDEBUG("read completed");
         }
 
-        read += entry->size;
-        *f_pos += entry->size;
+        if (copy_to_user((buf + read), (entry->buffptr + offset), how_many)) {
+                PDEBUG("ERROR: copy_to_user() failed");
+                goto exit;
+        }
 
-    } while (read < count);
+        read += how_many;
+        *f_pos += how_many;
+    }
 
+    PDEBUG("*** READ %ld BYTES ***", read);
 exit:
     mutex_unlock(&dev->lock);
     return read;
@@ -118,23 +131,29 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
     dev->write_buffer.buffptr = tmp_buf;
     dev->write_buffer.size += count;
 
-    PDEBUG("tmp: %s", tmp_buf);
-    PDEBUG("write_buffer: %s", dev->write_buffer.buffptr);
+    // PDEBUG("tmp: %s", tmp_buf);
+    // PDEBUG("write_buffer: %s", dev->write_buffer.buffptr);
 
     if (dev->write_buffer.buffptr[dev->write_buffer.size - 1] == '\n') {
-        new_entry.buffptr = kmalloc(dev->write_buffer.size * sizeof(char), GFP_KERNEL);
-        if (!new_entry.buffptr) {
+        size_t alloc;
+        char *tmp;
+
+        alloc = (dev->write_buffer.size * sizeof(char)) + 1; /* +1 for '\0' */
+        tmp = kmalloc(alloc, GFP_KERNEL);
+        if (!tmp) {
             PDEBUG("ERROR: kmalloc on new entry failed");
             retval = -ENOMEM;
             goto err;
         }
+        memset(tmp, 0, alloc);
 
-        strncpy((char * const)new_entry.buffptr, dev->write_buffer.buffptr, dev->write_buffer.size);
+        strncpy(tmp, dev->write_buffer.buffptr, dev->write_buffer.size);
+        new_entry.buffptr = tmp;
         new_entry.size = dev->write_buffer.size;
 
+        // PDEBUG("new write: %s", new_entry.buffptr);
         ret_buf = aesd_circular_buffer_add_entry(&(dev->buffer), &(new_entry));
         if (ret_buf) {
-            PDEBUG("buffer wrapped, freeing some memory %p", (void *)ret_buf);
             kfree(ret_buf);
         }
 
@@ -143,6 +162,7 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
         dev->write_buffer.size = 0;
     }
 
+    *f_pos += count;
     mutex_unlock(&dev->lock);
     return retval;
 
@@ -153,12 +173,47 @@ exit:
     return retval;
 }
 
+loff_t aessd_llseek(struct file *filp, loff_t off, int whence)
+{
+    struct aesd_dev *dev = filp->private_data;
+    loff_t new_pos;
+
+    switch (whence) {
+    case SEEK_SET:
+        new_pos = off;
+        break;
+    case SEEK_CUR:
+        new_pos = filp->f_pos + off;
+        break;
+    case SEEK_END:
+        // new_pos = (dev->buffer.in_offs - 1) + off;
+        size_t total = 0;
+        for (int i = 0; i < AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; i++) {
+            int idx = (i + dev->buffer.out_offs) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+            if (dev->buffer.entry[idx].buffptr)
+                total += dev->buffer.entry[idx].size;
+        }
+        new_pos = total + off;
+        break;
+    default:
+        return -EINVAL;
+    }
+
+    if (new_pos < 0)
+        return -EINVAL;
+
+    filp->f_pos = new_pos;
+
+    return new_pos;
+}
+
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
     .read =     aesd_read,
     .write =    aesd_write,
     .open =     aesd_open,
     .release =  aesd_release,
+    .llseek = aessd_llseek,
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)

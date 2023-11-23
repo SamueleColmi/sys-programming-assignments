@@ -10,11 +10,22 @@
 
 #ifdef __KERNEL__
 #include <linux/string.h>
+#include <linux/kernel.h>
 #else
 #include <string.h>
 #endif
 
 #include "aesd-circular-buffer.h"
+
+
+#undef PDEBUG             /* undef it, just in case */
+#ifdef __KERNEL__
+     /* This one if debugging is on, and kernel space */
+#define PDEBUG(fmt, args...) printk( KERN_DEBUG "aesdchar: " fmt, ## args)
+#else
+     /* This one for user space */
+#define PDEBUG(fmt, args...) fprintf(stderr, fmt, ## args)
+#endif
 
 /**
  * @param buffer the buffer to search for corresponding offset.  Any necessary locking must be performed by caller.
@@ -31,16 +42,24 @@ struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos(struct
 {
     int rd_idx;
 
+    PDEBUG("\tlooking for offset: %ld", char_offset);
     for (int i = 0; i < AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; i++) {
         rd_idx = (buffer->out_offs + i) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+        PDEBUG("\trd_idx = %d", rd_idx);
 
-        if (buffer->entry[rd_idx].buffptr == NULL)
-            break;
+        if (buffer->entry[rd_idx].buffptr == NULL) {
+            PDEBUG("\tbuffptr is null");
+            break; //continue?
+        }
 
+        PDEBUG("\tentry[%d].size: %ld", rd_idx, buffer->entry[rd_idx].size);
+        PDEBUG("\tdifference wrt offset is: %d", (int)(char_offset - buffer->entry[rd_idx].size));
         if ((int)(char_offset - buffer->entry[rd_idx].size) < 0) {
+            PDEBUG("\tentry found: %d", rd_idx);
             *entry_offset_byte_rtn = char_offset;
             return &(buffer->entry[rd_idx]);
         } else {
+            PDEBUG("\tnew iteration");
             char_offset = char_offset - (buffer->entry[rd_idx]).size;
         }
     }
