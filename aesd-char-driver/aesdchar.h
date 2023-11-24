@@ -33,5 +33,4 @@ struct aesd_dev
     struct cdev cdev;
 };
 
-
 #endif /* AESD_CHAR_DRIVER_AESDCHAR_H_ */
