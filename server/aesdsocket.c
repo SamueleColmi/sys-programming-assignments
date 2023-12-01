@@ -19,7 +19,7 @@
 #include <unistd.h>
 
 #define PORTNUM		(9000)
-#define BUFFER_SIZE	(8)
+#define BUFFER_SIZE	(32)
 #define USE_AESD_CHAR_DEVICE
 
 typedef struct node
@@ -35,6 +35,7 @@ typedef struct node
 typedef TAILQ_HEAD(head_s, node) head_t;
 
 #ifdef USE_AESD_CHAR_DEVICE
+#include "../aesd-char-driver/aesd_ioctl.h"
 static const char *device_path = "/dev/aesdchar";
 #else
 static const char *file_path = "/var/tmp/aesdsocketdata";
@@ -54,7 +55,7 @@ static void close_connection(int io_fd, struct sockaddr_in addr)
 	close(io_fd);
 }
 
-static bool reply(int sock_fd)
+static bool reply(int sock_fd, bool seek)
 {
 	size_t allocated = BUFFER_SIZE;
 	char *msg_buffer = NULL;
@@ -65,9 +66,16 @@ static bool reply(int sock_fd)
 	char *c = NULL;
 	int ch = 0;
 
-	if (fseek(fp, 0, SEEK_SET)) {
-		printf("Error: fseek failed: (-%d) %s\n", errno, strerror(errno));
-		goto exit;
+	if (seek) {
+		if (fseek(fp, 0, SEEK_SET)) {
+			printf("Error: SEEK_SET failed: (-%d) %s\n", errno, strerror(errno));
+			goto exit;
+		}
+	} else {
+		if (fseek(fp, 0, SEEK_CUR)) {
+			printf("Error: SEEK_CUR failed: (-%d) %s\n", errno, strerror(errno));
+			goto exit;
+		}
 	}
 
 	msg_buffer = calloc(allocated, sizeof(char));
@@ -100,10 +108,11 @@ static bool reply(int sock_fd)
 		}
 	}
 
-	if (send(sock_fd, msg_buffer, used - 1, 0) == -1)
+	if (send(sock_fd, msg_buffer, used - 1, 0) == -1) {
 		printf("Error: can't reply: (-%d) %s\n", errno, strerror(errno));
-	else
+	} else {
 		ret = true;
+	}
 
 free_all:
 	free(c);
@@ -132,11 +141,25 @@ static bool communicate(int io_fd)
 
 	int rec = 0;
 	while((rec = recv(io_fd, buffer, buf_size, 0)) > 0) {
+		bool seek = true;
+		int wr_cmd = 0;
+		int wr_off = 0;
 
 		buffer[rec] = '\0';
-		fprintf(fp, "%s", buffer); // scrive fino a '\0' escluso
+		if (sscanf(buffer, "AESDCHAR_IOCSEEKTO:%d,%d", &wr_cmd, &wr_off) != 2) {
+			fprintf(fp, "%s", buffer); // scrive fino a '\0' escluso
+		} else {
+			int fd_fp = fileno(fp);
+			struct aesd_seekto seekto;
+			seekto.write_cmd = wr_cmd;
+			seekto.write_cmd_offset = wr_off;
+			if (ioctl(fd_fp, AESDCHAR_IOCSEEKTO, &seekto) != 0)
+				printf("ioctl error\n");
+			seek = false;
+		}
+
 		if (buffer[rec - 1] == '\n') {
-			if (!reply(io_fd)) {
+			if (!reply(io_fd, seek)) {
 				printf("Error: reply\n");
 				r = false;
 				goto err;

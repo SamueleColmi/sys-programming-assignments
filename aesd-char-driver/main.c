@@ -19,6 +19,7 @@
 #include <linux/fs.h> // file_operations
 
 #include "aesdchar.h"
+#include "aesd_ioctl.h"
 
 int aesd_major =   0; // use dynamic major
 int aesd_minor =   0;
@@ -49,6 +50,8 @@ int aesd_release(struct inode *inode, struct file *filp)
 ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
                 loff_t *f_pos)
 {
+    PDEBUG("READ - f_pos=%llu - count=%zu\n", *f_pos, count);
+
     struct aesd_dev *dev = filp->private_data;
     struct aesd_buffer_entry *entry;
     bool read_again = true;
@@ -56,22 +59,31 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count,
     ssize_t offset = 0;
     ssize_t read = 0;
 
-    if (mutex_lock_interruptible(&dev->lock))
+    if (mutex_lock_interruptible(&dev->lock)) {
+        PDEBUG("restart sys\n");
         return -ERESTARTSYS;
+    }
 
     while (read_again) {
         entry = aesd_circular_buffer_find_entry_offset_for_fpos(&(dev->buffer), *f_pos, &offset);
-        if (!entry)
+        if (!entry) {
+            PDEBUG("entry is null, exiting\n");
             goto exit;
+        }
 
         if ((int)((count - (read + entry->size))) > 0) {
             how_many = entry->size;
         } else {
             how_many = (size_t)(count - read);
             read_again = false;
-            if ((how_many + offset) > entry->size)
-                how_many -= ((how_many + offset) - entry->size);
+            // if ((how_many + offset) > entry->size)
+            //     how_many -= ((how_many + offset) - entry->size);
         }
+
+        /**/
+        if ((how_many + offset) > entry->size)
+                how_many -= ((how_many + offset) - entry->size);
+        /**/
 
         if (copy_to_user((buf + read), (entry->buffptr + offset), how_many))
                 goto exit;
@@ -88,56 +100,64 @@ exit:
 ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count,
                 loff_t *f_pos)
 {
-
     struct aesd_dev *dev = filp->private_data;
-    struct aesd_buffer_entry new_entry;
+    const char *ret_buf = NULL;
     ssize_t retval = count;
-    const char *ret_buf;
+    size_t allocated;
     char *tmp_buf;
+
+    PDEBUG("WRITE - f_pos=%llu - count=%zu\n", *f_pos, count);
 
     if (mutex_lock_interruptible(&dev->lock))
         return -ERESTARTSYS;
 
-    tmp_buf = krealloc(dev->write_buffer.buffptr, (dev->write_buffer.size + count) * sizeof(char), GFP_KERNEL);
+    allocated = (dev->write_buffer.size + count + 1) * sizeof(char);    /* +1 for '\0' */
+    tmp_buf = krealloc(dev->write_buffer.buffptr, allocated, GFP_KERNEL);
     if (!tmp_buf) {
+        PDEBUG("Error: krealloc on write buffer failed\n");
         retval = -ENOMEM;
         goto exit;
     }
 
-    if (copy_from_user(tmp_buf + dev->write_buffer.size, buf, count)) {
+    if (copy_from_user(tmp_buf + dev->write_buffer.size, buf, count)) { // returns the number of bytes NOT copyed
+        PDEBUG("Error: copy_from_user() failed\n");
         retval = -EFAULT;
         goto err;
     }
 
+    tmp_buf[allocated - 1] = '\0';
     dev->write_buffer.buffptr = tmp_buf;
     dev->write_buffer.size += count;
 
     if (dev->write_buffer.buffptr[dev->write_buffer.size - 1] == '\n') {
-        size_t alloc;
-        char *tmp;
+        struct aesd_buffer_entry new_entry;
 
-        alloc = (dev->write_buffer.size * sizeof(char)) + 1; /* +1 for '\0' */
-        tmp = kmalloc(alloc, GFP_KERNEL);
-        if (!tmp) {
+        new_entry.buffptr = kmalloc(allocated, GFP_KERNEL);
+        if (!new_entry.buffptr) {
+            PDEBUG("Error: kmalloc on tmp buffer failed\n");
             retval = -ENOMEM;
             goto err;
         }
-        memset(tmp, 0, alloc);
 
-        strncpy(tmp, dev->write_buffer.buffptr, dev->write_buffer.size);
-        new_entry.buffptr = tmp;
+        if (!memcpy((void *)new_entry.buffptr, dev->write_buffer.buffptr, allocated)) {
+            PDEBUG("Error: memcpy() failed");
+            kfree(new_entry.buffptr);
+            retval = -ENOMEM;
+            goto err;
+        }
         new_entry.size = dev->write_buffer.size;
 
         ret_buf = aesd_circular_buffer_add_entry(&(dev->buffer), &(new_entry));
-        if (ret_buf)
+        if (ret_buf) {
             kfree(ret_buf);
+        }
 
+        *f_pos += dev->write_buffer.size;
         kfree(dev->write_buffer.buffptr);
         dev->write_buffer.buffptr = NULL;
         dev->write_buffer.size = 0;
     }
 
-    *f_pos += count;
     mutex_unlock(&dev->lock);
     return retval;
 
@@ -150,6 +170,7 @@ exit:
 
 loff_t aessd_llseek(struct file *filp, loff_t off, int whence)
 {
+    PDEBUG("SEEK - f_pos=%llu\n", off);
     struct aesd_dev *dev = filp->private_data;
     loff_t new_pos;
 
@@ -181,6 +202,80 @@ loff_t aessd_llseek(struct file *filp, loff_t off, int whence)
     return new_pos;
 }
 
+static int iocseekto(struct file *filp, uint32_t wr_cmd, uint32_t wr_off)
+{
+    PDEBUG("IOCSEEKTO: wr_cmd=%d - wr_off=%d\n", wr_cmd, wr_off);
+
+    struct aesd_dev *dev = filp->private_data;
+    loff_t new_pos = 0;
+    int idx;
+
+    if (mutex_lock_interruptible(&dev->lock))
+        return -ERESTARTSYS;
+
+    if (wr_cmd >= AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED) {
+        PDEBUG("Error: entry out-of-bound\n");
+        mutex_unlock(&dev->lock);
+        return -EINVAL;
+    }
+
+    idx = (dev->buffer.out_offs + wr_cmd) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+    if (!(dev->buffer.entry[idx].buffptr)) {
+        PDEBUG("Error: entry is null\n");
+        mutex_unlock(&dev->lock);
+        return -EINVAL;
+    }
+
+    if (wr_off >= dev->buffer.entry[idx].size) {
+        PDEBUG("Error: offset out-of-bound\n");
+        mutex_unlock(&dev->lock);
+        return -EINVAL;
+    }
+
+    for (int i = 0; i < wr_cmd; i++) {
+        int j = (dev->buffer.out_offs + i) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+        new_pos += dev->buffer.entry[j].size;
+    }
+
+    new_pos += wr_off;
+    filp->f_pos = new_pos;
+
+    mutex_unlock(&dev->lock);
+
+    return 0;
+}
+
+long aesd_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    PDEBUG("IOCTL\n");
+
+    struct aesd_seekto seekto;
+
+    if (_IOC_TYPE(cmd) != AESD_IOC_MAGIC) {
+        PDEBUG("Error: wrong magic (%d)\n", _IOC_TYPE(cmd));
+        return -ENOTTY;
+    }
+
+    if (_IOC_NR(cmd) > AESDCHAR_IOC_MAXNR) {
+        PDEBUG("Error: wrong number\n");
+        return -ENOTTY;
+    }
+
+    if (cmd == AESDCHAR_IOCSEEKTO) {
+        if (copy_from_user(&seekto, (const char __user *) arg, sizeof(seekto))) {
+            PDEBUG("Error: copy_from_user() failed\n");
+            return -EFAULT;
+        } else {
+            return iocseekto(filp, seekto.write_cmd, seekto.write_cmd_offset);
+        }
+    } else {
+        PDEBUG("Error: wrong cmd\n");
+        return -ENOTTY;
+    }
+
+    return -1;
+}
+
 struct file_operations aesd_fops = {
     .owner =    THIS_MODULE,
     .read =     aesd_read,
@@ -188,6 +283,7 @@ struct file_operations aesd_fops = {
     .open =     aesd_open,
     .release =  aesd_release,
     .llseek = aessd_llseek,
+    .unlocked_ioctl = aesd_ioctl,
 };
 
 static int aesd_setup_cdev(struct aesd_dev *dev)
@@ -199,20 +295,22 @@ static int aesd_setup_cdev(struct aesd_dev *dev)
     dev->cdev.ops = &aesd_fops;
     err = cdev_add (&dev->cdev, devno, 1);
     if (err < 0)
-        PDEBUG("ERROR: can't add char device - errno: %d", err);
+        PDEBUG("ERROR: can't add char device - errno: %d\n", err);
 
     return err;
 }
 
 int aesd_init_module(void)
 {
+    PDEBUG("INIT\n");
+
     dev_t dev = 0;
     int result;
 
     /* Allocate major */
     result = alloc_chrdev_region(&dev, aesd_minor, 1,"aesdchar");
     if (result < 0) {
-        PDEBUG("ERROR: can't get major number - errno: %d", result);
+        PDEBUG("ERROR: can't get major number - errno: %d\n", result);
         return result;
     } else {
         aesd_major = MAJOR(dev);
@@ -221,7 +319,7 @@ int aesd_init_module(void)
     /* Initialize dev structure */
     aesd_device = kmalloc(sizeof(struct aesd_dev), GFP_KERNEL);
     if (!aesd_device) {
-        PDEBUG("ERRROR: can't allocate memory for aesd device struct");
+        PDEBUG("ERRROR: can't allocate memory for aesd device struct\n");
         result = -ENOMEM;
         goto alloc_err;
     }
@@ -243,7 +341,7 @@ setup_err:
     kfree(aesd_device);
 alloc_err:
     unregister_chrdev_region(dev, 1);
-    PDEBUG("ERROR: init failed");
+    PDEBUG("ERROR: init failed\n");
     return result;
 }
 
@@ -257,6 +355,7 @@ static void cleanup_buffer(void)
 
 void aesd_cleanup_module(void)
 {
+    PDEBUG("CLEANUP\n");
     dev_t devno;
 
     devno = MKDEV(aesd_major, aesd_minor);
